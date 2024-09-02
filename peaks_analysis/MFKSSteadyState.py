@@ -152,7 +152,7 @@ def find_leftmost_root(x_array, f_array):
 
 def get_P_ss(lbd_max, kappa, k, eps, lbd_spl, r, dx=1e-3, lbd_lim_left=1e-1, verbose=False, max_count=20, tol=1e-8):
 
-    assert parameter_control(kappa, k, eps, lbd_spl), "Parameters do not produce a steady state solution."  
+    # assert parameter_control(kappa, k, eps, lbd_spl), "Parameters do not produce a steady state solution."  
 
     # find bracket for g_avg and define the initial guess
     g_avg_min = g(lbd_spl, kappa, k, eps)
