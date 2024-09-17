@@ -4,15 +4,7 @@ from scipy.integrate import cumulative_trapezoid, solve_ivp
 from scipy.interpolate import Akima1DInterpolator
 from scipy.optimize import bisect
 from scipy.special import spence
-
-def rate(lbd, lbd_spl, r):
-    return np.maximum(0, r * (lbd - lbd_spl))
-
-def g(lbd, kappa, k, eps):
-	if eps == 0.0:
-		return kappa * np.exp(-k * lbd)
-	else: 
-		return kappa * np.exp(-k * lbd) + eps * lbd
+from utils import rate, g
 
 def v_Mss(lbd, g_avg, kappa, k, eps):
     return g_avg - g(lbd, kappa, k, eps)
@@ -44,7 +36,6 @@ def parameter_control(kappa, k, eps, lbd_spl):
     if g_avg_min < g_avg_max:
         return True
     else:
-        print("Parameters do not produce a steady state solution."  )
         return False
 
 def h(lbd, lbd_inf, g_avg, kappa, k, eps, lbd_spl, r):
@@ -85,7 +76,6 @@ def get_particular(lbd_array_current, lbd_array_full, P_array_full, lbd_inf, g_a
     # integrate from above
     return cumulative_trapezoid_reversed(particular_prime, lbd_array_current, final_value=final) 
 
-
 def P_solve(lbd_array_current, lbd_array_full, P_array_full, lbd_inf, g_avg, kappa, k, eps, lbd_spl, r):
     # given P on some array, estimate it on another array 
     particular = get_particular(lbd_array_current, lbd_array_full, P_array_full, lbd_inf, g_avg, kappa, k, eps, lbd_spl, r)
@@ -97,7 +87,6 @@ def P_solve(lbd_array_current, lbd_array_full, P_array_full, lbd_inf, g_avg, kap
         res = np.nan_to_num(res, nan=0.0)
 
     return res * particular
-
 
 def cascade_solve_P(lbd_max, lbd_inf, g_avg, kappa, k, eps, lbd_spl, r, dx, lbd_lim_left, verbose):    
 
@@ -131,28 +120,51 @@ def cascade_solve_P(lbd_max, lbd_inf, g_avg, kappa, k, eps, lbd_spl, r, dx, lbd_
 
     return lbd_array_full, P_array_full
 
-
-def find_leftmost_root(x_array, f_array):
+def find_leftmost_root(x_array, f_array, tol=1e-8, max_iter=100):
     # Ensure that the input arrays are numpy arrays
     x_array = np.array(x_array)
     f_array = np.array(f_array)
     
-    # Check for sign change and perform linear interpolation
+    # Check for sign change and perform root-finding
     for i in range(len(f_array) - 1):
-        if f_array[i] * f_array[i + 1] < 0:
+        if f_array[i] * f_array[i + 1] <= 0:
             # Sign change detected between f_array[i] and f_array[i + 1]
             x1, x2 = x_array[i], x_array[i + 1]
             f1, f2 = f_array[i], f_array[i + 1]
-            # Linear interpolation formula to find the root
+            
+            # If both f1 and f2 are small, use the bisection method for accuracy
+            if abs(f1) < tol and abs(f2) < tol:
+                return bisect_root(x1, x2, f1, f2, tol, max_iter)
+            
+            # Linear interpolation as the first approximation
             x_root = x1 - f1 * (x2 - x1) / (f2 - f1)
-            return x_root
+            
+            # Refine the root using the bisection method
+            return bisect_root(x1, x2, f1, f2, tol, max_iter)
     
     # if no root found 
     raise ValueError('The array has no root.')
 
-def get_P_ss(lbd_max, kappa, k, eps, lbd_spl, r, dx=1e-3, lbd_lim_left=1e-1, verbose=False, max_count=20, tol=1e-8):
+def bisect_root(x1, x2, f1, f2, tol, max_iter):
+    """Refine the root using the bisection method."""
+    for _ in range(max_iter):
+        x_mid = (x1 + x2) / 2
+        f_mid = (f1 + f2) / 2  # Ideally, you would calculate f(x_mid) here
+        
+        if abs(f_mid) < tol or (x2 - x1) < tol:
+            return x_mid
+        
+        # Narrow down the interval
+        if f1 * f_mid < 0:
+            x2, f2 = x_mid, f_mid
+        else:
+            x1, f1 = x_mid, f_mid
+    
+    return (x1 + x2) / 2  # Return the midpoint as the best estimate after max_iter
 
-    # assert parameter_control(kappa, k, eps, lbd_spl), "Parameters do not produce a steady state solution."  
+def get_P_ss(lbd_max, kappa, k, eps, lbd_spl, r, dx=1e-3, lbd_lim_left=1e-1, verbose=False, max_count=50, tol=1e-10):
+
+    assert parameter_control(kappa, k, eps, lbd_spl), "Parameters do not produce a steady state solution."  
 
     # find bracket for g_avg and define the initial guess
     g_avg_min = g(lbd_spl, kappa, k, eps)
@@ -178,6 +190,7 @@ def get_P_ss(lbd_max, kappa, k, eps, lbd_spl, r, dx=1e-3, lbd_lim_left=1e-1, ver
         # set new g_avg_best
         g_avg_prev = g_avg_best
         g_avg_best = g(root, kappa, k, eps)
+
         # make sure we stay within the physical bracket
         assert g_avg_best > g_avg_min, f"g_avg_best too small, {g_avg_best = }, {g_avg_min = }"
         assert g_avg_best < g_avg_max, f"g_avg_best too big, {g_avg_best = }, {g_avg_max = }"
@@ -188,3 +201,4 @@ def get_P_ss(lbd_max, kappa, k, eps, lbd_spl, r, dx=1e-3, lbd_lim_left=1e-1, ver
     P_array /= np.trapz(P_array, lbd_array)
     if verbose: print(f"Numerically set g_avg: {g_avg_best:.2e}, emerging g_avg: {np.trapz(P_array * g(lbd_array, kappa, k, eps), lbd_array):.2e}. ")
     return lbd_array, P_array
+

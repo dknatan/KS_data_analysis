@@ -16,7 +16,7 @@ def g_avg(mu, sig, kappa, k, eps, lbd_spl, r):
 def lbd_g_avg(mu, sig, kappa, k, eps, lbd_spl, r):
     args = (mu, sig, kappa, k, eps, lbd_spl, r)
     return (kappa * (mu - k * sig**2) * np.exp(-k * mu + 0.5 * k**2 * sig**2) * erfc(-(mu - k * sig**2) / sig) / erfc(-mu / sig) +
-            kappa * sig**2 * gauss(mu, sig) +
+            kappa * sig**2 * gauss(mu, sig) / erfc(-mu / sig) +
             eps * (sig**2 + mu**2) +
             eps * mu * sig**2 * gauss(mu, sig) / erfc(-mu / sig)
             )
