@@ -190,7 +190,7 @@ def jac_dydt(t, y, adj_matr, kappa, k, eps, lbd_spl):
     return adj_matr @ np.diag(g_prime(y, kappa, k, eps))
 
 def event_zero(t, y, adj_matr, kappa, k, eps, lbd_spl):
-    return np.min(y[y != 0]) - 1e-3
+    return np.min(y[y != 0]) - 1e-1
 
 event_zero.terminal = True
 event_zero.direction = -1
@@ -214,8 +214,8 @@ def get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl):
     return event_split
 
 def fix_negative_adaptive(lbd_vect, adj_matr):
-    while np.any(np.isclose(lbd_vect[lbd_vect != 0.0], 1e-3)):
-        ind_negative = np.where(np.logical_and(np.isclose(lbd_vect, 1e-3), lbd_vect != 0.0))[0][0]
+    while np.any(np.isclose(lbd_vect[lbd_vect != 0.0], 1e-1)):
+        ind_negative = np.where(np.logical_and(np.isclose(lbd_vect, 1e-1), lbd_vect != 0.0))[0][0]
 
         inds_neighbors = sparse_find_neighbors(adj_matr, ind_negative) 
         if len(inds_neighbors) == 2:
@@ -411,7 +411,7 @@ def evolve_adapt_timestep(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, n_step
 # 3D hard splitting functions
 def get_event_split_hard(adj_matr, kappa, k, eps, lbd_spl):
     def event_split(t, y, adj_matr, kappa, k, eps, lbd_spl):
-        return np.max(y - lbd_spl)
+        return np.max(y - 4/3*lbd_spl)
     
     event_split.terminal = True
     event_split.direction = 1
@@ -661,7 +661,7 @@ def evolve_adapt_timestep_equi_time_hardmax(Nmax, L_full, Drho, Dc, T, epsilon, 
                         t_span=(time_current, split_times_queue[0]), 
                         y0=lbd_vect, 
                         method='BDF',
-                        events=[event_zero, get_event_split(included_inds, adj_matr, kappa, k, eps, lbd_spl), get_event_split_hard(adj_matr, kappa, k, eps, 1.2*lbd_spl)], 
+                        events=[event_zero, get_event_split(included_inds, adj_matr, kappa, k, eps, lbd_spl), get_event_split_hard(adj_matr, kappa, k, eps, 4/3*lbd_spl)], 
                         args=(adj_matr, kappa, k, eps, lbd_spl),
                         jac=jac_dydt,
                         rtol=1e-6) # also can help: max_step, first_step (parameters)
@@ -703,7 +703,7 @@ def evolve_adapt_timestep_equi_time_hardmax(Nmax, L_full, Drho, Dc, T, epsilon, 
 
             # determine where hard split happened & split
             lbd_vect = sol.y_events[2][0]
-            split_index = np.argmin(np.abs(lbd_vect - lbd_spl))
+            split_index = np.argmin(np.abs(lbd_vect - 4/3*lbd_spl))
             lbd_vect, adj_matr = split(split_index, sol.y_events[2][0], adj_matr)
             adj_matr = csr_matrix(adj_matr.toarray())
             
@@ -801,7 +801,7 @@ def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, 
                         y0=lbd_vect, 
                         method='BDF',
                         t_eval=t_eval_current if save_bool else None, 
-                        events=[event_zero] + [get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl) for ind in included_inds if ind not in split_index_queue], 
+                        events=[event_zero] + [get_event_split(np.where(lbd_vect > lbd_spl)[0], adj_matr, kappa, k, eps, lbd_spl)] + [get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl) for ind in included_inds if ind not in split_index_queue], 
                         args=(adj_matr, kappa, k, eps, lbd_spl),
                         jac=jac_dydt,
                         rtol=1e-6) # also can help: max_step (parameter)
@@ -811,7 +811,7 @@ def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, 
 
         elif sol.status == 1:
             # determine which event happened
-            event_ind = [ind for ind in np.arange(len(included_inds) + 1 - len(split_index_queue) + 1, dtype=int) if len(sol.y_events[ind]) > 0][0]
+            event_ind = [ind for ind in np.arange(1 + 1 + len(included_inds) - (len(split_index_queue) - 1), dtype=int) if len(sol.y_events[ind]) > 0][0]
 
             if save_bool:
                 lbd_vect_t[:, ind_current_lo:int(sol.t_events[event_ind][0] / dt) + 1] = sol.y[:, min(_counter, 1):]
@@ -828,9 +828,29 @@ def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, 
                 # perform merge
                 lbd_vect, adj_matr = fix_negative_adaptive(lbd_vect, adj_matr)
 
+            elif event_ind == 1: # hard split event
+                if verbose: print(f'Interrupted by hard split at {time_current = :.1f}')
+                print(f'{split_index_queue = }, {lbd_vect }')
+                # determine where split happened
+                split_index = np.argmin(np.abs(lbd_vect - 4/3*lbd_spl))
+                lbd_vect, adj_matr = split(split_index, lbd_vect, adj_matr)
+                
+                # find the split index in the splitting queue
+                ind_ind = split_index_queue.index(split_index)
+                # exclude it from the queue
+                split_index_queue.pop(ind_ind)
+                # exclude the previously sampled split time 
+                split_times_queue.pop(ind_ind)
+
+                # possibly fix ind_current_hi
+                ind_current_hi = int(split_times_queue[0] / dt) + 1
+
+                # after splitting there are more plateaus
+                included_inds = [ind for ind in np.arange(stop=len(lbd_vect), dtype=int) if lbd_vect[ind] > 0.0]
+
             else: # split threshold reached
                 # determine where split happened
-                split_index = [ind for ind in included_inds if ind not in split_index_queue][event_ind - 1]
+                split_index = [ind for ind in included_inds if ind not in split_index_queue][event_ind - 2]
                 
                 # exclude the split index from split monitoring
                 # included_inds = np.delete(included_inds, np.where(included_inds == split_index)[0][0])
