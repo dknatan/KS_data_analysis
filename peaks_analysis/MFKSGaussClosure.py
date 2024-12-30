@@ -6,19 +6,25 @@ from scipy.integrate import solve_ivp
 def gauss(x, s=1):
     return 1 / np.sqrt(2 * np.pi) / s * np.exp(-0.5 * x**2 / s**2)
 
+def positive_gaussian(x, s=1):
+    return 1 / np.sqrt(2 * np.pi) / s * np.exp(-0.5 * x**2 / s**2) / erfc(-x/s)
+
 def erfc(x):
     return 0.5 * (1 - erf(x / np.sqrt(2)))
 
+def lbd_avg(mu, sig):
+    return mu + sig**2 * positive_gaussian(mu, sig)
+
 def g_avg(mu, sig, kappa, k, eps, lbd_spl, r):
     mu_tilde = mu - k * sig**2
-    return kappa * np.exp(-k * mu + k**2 * sig**2 / 2) * erfc(-(mu - k * sig**2) / sig) / erfc(-mu / sig) + eps * mu + eps * sig**2 * gauss(mu, sig) / erfc(- mu / sig)
+    return kappa * np.exp(-k * mu + k**2 * sig**2 / 2) * erfc(-(mu - k * sig**2) / sig) / erfc(-mu / sig) + eps * lbd_avg(mu, sig)
     
 def lbd_g_avg(mu, sig, kappa, k, eps, lbd_spl, r):
     args = (mu, sig, kappa, k, eps, lbd_spl, r)
     return (kappa * (mu - k * sig**2) * np.exp(-k * mu + 0.5 * k**2 * sig**2) * erfc(-(mu - k * sig**2) / sig) / erfc(-mu / sig) +
-            kappa * sig**2 * gauss(mu, sig) / erfc(-mu / sig) +
+            kappa * sig**2 * positive_gaussian(mu, sig) +
             eps * (sig**2 + mu**2) +
-            eps * mu * sig**2 * gauss(mu, sig) / erfc(-mu / sig)
+            eps * mu * sig**2 * positive_gaussian(mu, sig)
             )
 
 def rate_avg(mu, sig, kappa, k, eps, lbd_spl, r):
@@ -35,14 +41,38 @@ def lbd2_rate_avg(mu, sig, kappa, k, eps, lbd_spl, r):
             2 * r * mu * sig**2 * erfc((lbd_spl - mu) / sig) / erfc(- mu / sig) + 
             r * sig**4 * gauss(lbd_spl - mu, sig) / erfc(- mu / sig) )
 
+def positive_gaussian_prime(x):
+    return -x * positive_gaussian(x) - positive_gaussian(x)**2
+
+def dNdt_overN(mu, sig, kappa, k, eps, lbd_spl, r):
+    return positive_gaussian(mu, sig) * (g_avg(mu, sig, kappa, k, eps, lbd_spl, r) - kappa) + 0.5 * rate_avg(mu, sig, kappa, k, eps, lbd_spl, r)
+
+def dVardt(mu, sig, kappa, k, eps, lbd_spl, r):
+    return 2 * g_avg(mu, sig, kappa, k, eps, lbd_spl, r) * lbd_avg(mu, sig) - 2 * lbd_g_avg(mu, sig, kappa, k, eps, lbd_spl, r) - 0.25 * lbd2_rate_avg(mu, sig, kappa, k, eps, lbd_spl, r)
+
+def rhs1_tilde(mu, sig, kappa, k, eps, lbd_spl, r):
+    return 0 - lbd_avg(mu, sig) * dNdt_overN(mu, sig, kappa, k, eps, lbd_spl, r)
+
+def rhs2_tilde(mu, sig, kappa, k, eps, lbd_spl, r):
+    return dVardt(mu, sig, kappa, k, eps, lbd_spl, r) - sig**2 * dNdt_overN(mu, sig, kappa, k, eps, lbd_spl, r)
+
 def mu_prime(mu, sig, kappa, k, eps, lbd_spl, r):
-    args = (mu, sig, kappa, k, eps, lbd_spl, r)
-    return - mu * (gauss(mu, sig) * (g_avg(*args) - kappa) + 0.5 * rate_avg(*args))
+    res = 2 * sig * rhs1_tilde(mu, sig, kappa, k, eps, lbd_spl, r) - (positive_gaussian(mu/sig) + mu/sig * positive_gaussian_prime(mu/sig)) * rhs2_tilde(mu, sig, kappa, k, eps, lbd_spl, r)
+    return res / ((1 - positive_gaussian_prime(mu/sig)) * 2 * sig - lbd_avg(mu, sig) * (positive_gaussian(mu/sig) + mu/sig * positive_gaussian_prime(mu/sig)))
 
 def sig_prime(mu, sig, kappa, k, eps, lbd_spl, r):
-    args = (mu, sig, kappa, k, eps, lbd_spl, r)
-    res = g_avg(*args) * (mu + sig**2 * gauss(mu, sig) / erfc(- mu / sig)) - lbd_g_avg(*args) - 1/8 * lbd2_rate_avg(*args) + 0.5 * (mu**2 - sig**2) * (gauss(mu, sig) * (g_avg(*args) - kappa) + 0.5 * rate_avg(*args))
-    return res / sig
+    res = -lbd_avg(mu, sig) * rhs1_tilde(mu, sig, kappa, k, eps, lbd_spl, r) + (1 - positive_gaussian_prime(mu/sig)) * rhs2_tilde(mu, sig, kappa, k, eps, lbd_spl, r)
+    return res / ((1 - positive_gaussian_prime(mu/sig)) * 2 * sig - lbd_avg(mu, sig) * (positive_gaussian(mu/sig) + mu/sig * positive_gaussian_prime(mu/sig)))
+
+
+# def mu_prime(mu, sig, kappa, k, eps, lbd_spl, r):
+#     args = (mu, sig, kappa, k, eps, lbd_spl, r)
+#     return - mu * (gauss(mu, sig) * (g_avg(*args) - kappa) + 0.5 * rate_avg(*args))
+
+# def sig_prime(mu, sig, kappa, k, eps, lbd_spl, r):
+    # args = (mu, sig, kappa, k, eps, lbd_spl, r)
+    # res = g_avg(*args) * (mu + sig**2 * gauss(mu, sig) / erfc(- mu / sig)) - lbd_g_avg(*args) - 1/8 * lbd2_rate_avg(*args) + 0.5 * (mu**2 - sig**2) * (gauss(mu, sig) * (g_avg(*args) - kappa) + 0.5 * rate_avg(*args))
+    # return res / sig
 
 def mu_sig_prime(mu_sig, kappa, k, eps, lbd_spl, r):
     args = (kappa, k, eps, lbd_spl, r)
@@ -79,6 +109,9 @@ def F2(mu, sig, kappa, k, eps, lbd_spl, r):
     return f2(*args) / sig + (mu**2 - sig **2) / 2 / sig * f1(*args)
 
 
+
+
+
 def gauss_spl(mu, sig, kappa, k, eps, lbd_spl, r):
     args = (mu, sig, kappa, k, eps, lbd_spl, r)
     return gauss(mu - lbd_spl, sig)
@@ -91,7 +124,7 @@ def erfc_til(mu, sig, kappa, k, eps, lbd_spl, r):
     args = (mu, sig, kappa, k, eps, lbd_spl, r)
     return erfc(-(mu - k * sig**2) / sig)
 
-
+# derivatives
 def dmu_gauss(mu, sig, kappa, k, eps, lbd_spl, r):
     args = (mu, sig, kappa, k, eps, lbd_spl, r)
     return -mu / sig**2 * gauss(mu, sig)

@@ -42,12 +42,12 @@ def get_MF_samples(num_samples, Drho, Dc, T, epsilon, r, lbd_spl, dx=1e-4, lbd_m
 
     return np.array(samples)
 
-def get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, ini_dist_type='chaos', seed=0):
+def get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, initial_distribution='chaos', seed=0):
 
-    if ini_dist_type == 'gauss':
+    if initial_distribution == 'gauss':
         np.random.seed(seed)
         lbd_vect = mu + sig * np.random.randn(Nmax)
-    elif ini_dist_type == 'chaos':
+    elif initial_distribution == 'chaos':
         lbd_vect = get_MF_samples(Nmax, Drho, Dc, T, epsilon, r, lbd_spl, seed=seed)
        
     too_big_inds = np.where(np.cumsum(lbd_vect) > L_full)[0]
@@ -196,8 +196,13 @@ event_zero.terminal = True
 event_zero.direction = -1
 
 def get_event_split(included_inds, adj_matr, kappa, k, eps, lbd_spl):
-    def event_split(t, y, adj_matr, kappa, k, eps, lbd_spl):
-        return np.max(y[included_inds] - lbd_spl)
+
+    if len(included_inds) == 0:
+        def event_split(t, y, adj_matr, kappa, k, eps, lbd_spl):
+            return -1
+    else:
+        def event_split(t, y, adj_matr, kappa, k, eps, lbd_spl):
+            return np.max(y[included_inds] - lbd_spl)
     
     event_split.terminal = True
     event_split.direction = 1
@@ -268,263 +273,6 @@ def insert_sorted2(arr, element, arr2, element2):
     
     return arr, arr2
 
-def evolve_adapt_timestep(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, n_steps, dt, ini_dist_type, mu, sig, verbose=False, tqdm_bool=True, maxiter=1000, seed=0):
-    
-    kappa, k, eps, _, _ = reparameterize(Drho, Dc, T, epsilon, r)
-    # initial conditions
-    lbd_vect_ini, adj_matr_ini = get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, ini_dist_type, seed=seed)
-
-    # initialize variables
-    t_range = np.arange(0, dt * n_steps, dt)
-    lbd_vect_t = np.zeros((Nmax, n_steps))
-    adj_matr_t = np.zeros((n_steps), dtype=object)
-    lbd_vect_t[:, 0] = lbd_vect_ini.copy()
-    adj_matr_t[0] = adj_matr_ini.copy()
-
-    lbd_vect, adj_matr = lbd_vect_ini.copy(), adj_matr_ini.copy()
-    random_uniform = PrecompiledRandomGenerator(100_000, seed=seed)
-
-    # initialize loop variables
-    time_current = 0.0
-    ind_current_lo = 0
-    ind_current_hi = n_steps
-        
-    split_times_queue = [dt * n_steps]
-    split_index_queue = [None]
-
-    included_inds = np.arange(stop=len(lbd_vect), dtype=int)
-    finished_bool = False
-    
-    _iter = tqdm(range(maxiter), desc='Worst case timer: ') if tqdm_bool else range(maxiter)
-    for _counter in _iter:
-        # check if finished
-        if finished_bool:
-            break
-
-        if _counter == 0:
-            t_eval_current = t_range
-        else:
-            # insert current time to evaluation array to ensure potential event occurs on the evaluated interval
-            t_eval_current = np.insert(t_range[ind_current_lo:ind_current_hi], 0, time_current)
-            if split_index_queue[0] != None:
-                # insert last split time to know the initial condition for next steps
-                t_eval_current = np.append(t_eval_current, split_times_queue[0])
-
-        if _counter > 11000: verbose = True
-
-        if verbose: print(f'# active: {np.sum(lbd_vect > 0)}')
-        
-        # evolve and (maybe) be interrupted 
-        sol = solve_ivp(dydt, 
-                        t_span=(time_current, split_times_queue[0]), 
-                        y0=lbd_vect, 
-                        method='BDF',
-                        t_eval=t_eval_current, 
-                        events=[event_zero, get_event_split(included_inds, adj_matr, kappa, k, eps, lbd_spl)], 
-                        args=(adj_matr, kappa, k, eps, lbd_spl),
-                        jac=jac_dydt,
-                        rtol=1e-6) # also can help: max_step (parameter)
-        
-        if len(sol.y_events[0] > 0): # merging event
-            # save
-            lbd_vect_t[:, ind_current_lo:int(sol.t_events[0][0] / dt) + 1] = sol.y[:, min(_counter, 1):]
-            adj_matr_t[ind_current_lo:int(sol.t_events[0][0] / dt) + 1] = adj_matr.copy()
-
-            # update timing
-            time_current = sol.t_events[0][0]
-            ind_current_lo = int(time_current / dt) + 1
-
-            if verbose: print(f'Interrupted by negative at {time_current = :.1f}')
-            
-            # perform merge
-            lbd_vect = sol.y_events[0][0]
-            lbd_vect, adj_matr = fix_negative_adaptive(lbd_vect, adj_matr)
-
-        elif len(sol.y_events[1] > 0): # split threshold reached
-            # save
-            lbd_vect_t[:, ind_current_lo:int(sol.t_events[1][0] / dt) + 1] = sol.y[:, min(_counter, 1):]
-            adj_matr_t[ind_current_lo:int(sol.t_events[1][0] / dt) + 1] = adj_matr.copy()
-            
-            # update timing
-            time_current = sol.t_events[1][0]
-            ind_current_lo = int(time_current / dt) + 1
-
-            # determine where split happened
-            lbd_vect = sol.y_events[1][0]
-            split_index = np.argmin(np.abs(lbd_vect - lbd_spl))
-            
-            # exclude the split index from split monitoring
-            included_inds = np.delete(included_inds, np.where(included_inds == split_index)[0][0])
-                
-            # sample time-to-split: inv_P(uniform) is a sampled time-to-split (approx)
-            dLambdadt = dydt(0.0, lbd_vect, adj_matr, kappa, k, eps, lbd_spl)[split_index] 
-            split_time = time_current + np.sqrt(-2 / r / dLambdadt * np.log(1 - random_uniform.get_next()))
-            
-            # add time and split index to split queues
-            split_times_queue, split_index_queue = insert_sorted2(split_times_queue, split_time, split_index_queue, split_index)
-            if verbose: print(f'Interrupted by split at {time_current = :.1f}, {split_index = }, sampled new split time: {split_time:.2f}')
-            
-            # update first expected time of split
-            ind_current_hi = int(split_times_queue[0] / dt) + 1
-        
-        else:
-            if split_index_queue[0] != None: # splitting time reached
-                if verbose: print('Integrated until split time')
-                # save
-                try:
-                    lbd_vect_t[:, ind_current_lo:ind_current_hi] = sol.y[:, min(_counter, 1):-1]
-                except:
-                    print(sol)
-                    print(adj_matr)
-                adj_matr_t[ind_current_lo:ind_current_hi] = adj_matr.copy()
-
-                # perform split
-                split_index = split_index_queue.pop(0)
-                lbd_vect, adj_matr = split(split_index, sol.y[:, -1], adj_matr)
-                adj_matr = csr_matrix(adj_matr.toarray())
-                
-                # include the split index to split monitoring
-                included_inds = insert_sorted(included_inds, split_index)
-
-                # remove time from split queue, update times and indices
-                time_current = split_times_queue.pop(0)
-                ind_current_lo = int(time_current / dt) + 1
-                ind_current_hi = int(split_times_queue[0] / dt) + 1
-
-            else: # final time reached
-                if verbose: print('Finishing up.')
-                # save
-                try:
-                    lbd_vect_t[:, ind_current_lo:ind_current_hi] = sol.y[:, min(_counter, 1):]
-                except:
-                    print(sol)
-                    print(adj_matr)
-                adj_matr_t[ind_current_lo:ind_current_hi] = adj_matr.copy()
-
-                finished_bool = True
-
-        _counter += 1
-        if verbose: print(f'excluded indices: {[item for item in np.arange(stop=len(lbd_vect), dtype=int) if item not in included_inds]}')
-    
-    return t_range, lbd_vect_t, adj_matr_t
-
-# 3D hard splitting functions
-def get_event_split_hard(adj_matr, kappa, k, eps, lbd_spl):
-    def event_split(t, y, adj_matr, kappa, k, eps, lbd_spl):
-        return np.max(y - 4/3*lbd_spl)
-    
-    event_split.terminal = True
-    event_split.direction = 1
-
-    return event_split
-
-def evolve_adapt_timestep_hard_split(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, n_steps, dt, ini_dist_type, mu, sig, verbose=False, tqdm_bool=True, maxiter=1000, seed=0):
-    # differs from evolve_adapt_timestep by 1. r=inf, 2. saves points at splitting
-    kappa, k, eps, _, _ = reparameterize(Drho, Dc, T, epsilon, r)
-    # initial conditions
-    lbd_vect_ini, adj_matr_ini = get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, ini_dist_type, seed=seed)
-    # presplit
-    if verbose: print('Presplitting ...')
-    while np.any(lbd_vect_ini > lbd_spl):
-        lbd_vect_ini, adj_matr_ini = split(np.where(lbd_vect_ini > lbd_spl)[0][0], lbd_vect_ini, adj_matr_ini)
-    # make sure all positive
-    while np.any(lbd_vect_ini < 0):
-        lbd_vect_ini, adj_matr_ini = fix_negative(lbd_vect_ini, adj_matr_ini)
-
-    Nmax = len(lbd_vect_ini)
-
-    # initialize variables
-    t_range = np.arange(0, dt * n_steps, dt)
-    lbd_vect_t = np.zeros((Nmax, n_steps))
-    adj_matr_t = np.zeros((n_steps), dtype=object)
-    lbd_vect_t[:, 0] = lbd_vect_ini
-    adj_matr_t[0] = adj_matr_ini
-
-    lbd_vect, adj_matr = lbd_vect_ini, adj_matr_ini
-    t_range_split, lbd_vect_split, adj_matr_split = [], [], []
-
-    # initialize loop variables
-    time_current = 0.0
-    ind_current_lo = 0
-        
-    finished_bool = False
-    
-    _iter = tqdm(range(maxiter), desc='Worst case timer: ') if tqdm_bool else range(maxiter)
-    for _counter in _iter:
-        # check if finished
-        if finished_bool:
-            break
-
-        if _counter == 0:
-            t_eval_current = t_range
-        else:
-            # insert current time to evaluation array to ensure potential event occurs on the evaluated interval
-            t_eval_current = np.insert(t_range[ind_current_lo:n_steps], 0, time_current)
-
-        if verbose: print(f'# active: {np.sum(lbd_vect > 0)}')
-        
-        # evolve and (maybe) be interrupted 
-        sol = solve_ivp(dydt, 
-                        t_span=(time_current, dt * n_steps), 
-                        y0=lbd_vect, 
-                        method='BDF',
-                        t_eval=t_eval_current, 
-                        events=[event_zero, get_event_split_hard(adj_matr, kappa, k, eps, lbd_spl)], 
-                        args=(adj_matr, kappa, k, eps, lbd_spl),
-                        jac=jac_dydt,
-                        rtol=1e-6) # also can help: max_step (parameter)
-        
-        if len(sol.y_events[0] > 0): # merging event
-            # save
-            lbd_vect_t[:, ind_current_lo:int(sol.t_events[0][0] / dt) + 1] = sol.y[:, min(_counter, 1):]
-            adj_matr_t[ind_current_lo:int(sol.t_events[0][0] / dt) + 1] = adj_matr.copy()
-
-            # update timing
-            time_current = sol.t_events[0][0]
-            ind_current_lo = int(time_current / dt) + 1
-
-            if verbose: print(f'Interrupted by negative at {time_current = :.1f}')
-            
-            # perform merge
-            lbd_vect, adj_matr = fix_negative_adaptive(sol.y_events[0][0], adj_matr)
-            adj_matr = csr_matrix(adj_matr.toarray())
-
-        elif len(sol.y_events[1] > 0): # split threshold reached
-            # save
-            lbd_vect_t[:, ind_current_lo:int(sol.t_events[1][0] / dt) + 1] = sol.y[:, min(_counter, 1):]
-            adj_matr_t[ind_current_lo:int(sol.t_events[1][0] / dt) + 1] = adj_matr.copy()
-            t_range_split.append(sol.t_events[1][0])
-            lbd_vect_split.append(sol.y_events[1][0])
-            adj_matr_split.append(adj_matr.copy())
-
-            # update timing
-            time_current = sol.t_events[1][0]
-            ind_current_lo = int(time_current / dt) + 1
-
-            # determine where split happened & split
-            lbd_vect = sol.y_events[1][0]
-            split_index = np.argmin(np.abs(lbd_vect - lbd_spl))
-            lbd_vect, adj_matr = split(split_index, sol.y_events[1][0], adj_matr)
-            adj_matr = csr_matrix(adj_matr.toarray())
-                        
-            # add time and split index to split queues
-            if verbose: print(f'Interrupted by split at {time_current = :.1f}, {split_index = }')
-                        
-            ind_current_lo = int(time_current / dt) + 1
-
-        else:
-            # final time reached
-            if verbose: print('Finishing up.')
-            # save
-            # lbd_vect_t[:, ind_current_lo:n_steps] = sol.y[:, min(_counter, 1):]
-            # adj_matr_t[ind_current_lo:n_steps] = adj_matr.copy()
-
-            finished_bool = True
-
-        _counter += 1
-    
-    return t_range, lbd_vect_t, adj_matr_t, np.array(t_range_split), np.array(lbd_vect_split).T, np.array(adj_matr_split)
-
 # equilibriation time functions
 def check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
     lbd_max = -1/k * np.log(eps/k/kappa)
@@ -532,241 +280,46 @@ def check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
     contracting_bool = np.sum((lbd_vect - np.mean(lbd_vect, where=lbd_vect>0)) * dydt(0.0, lbd_vect, adj_matr, kappa, k, eps, lbd_spl)) < 0
     return in_interval_bool and contracting_bool
 
-def evolve_adapt_timestep_equi_time(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, n_steps, dt, ini_dist_type, mu, sig, verbose=False, tqdm_bool=True, maxiter=1000, seed=0):
+def evolve_adapt_timestep(
+        Nmax, 
+        L_full, 
+        Drho, 
+        Dc, 
+        T, 
+        epsilon, 
+        r, 
+        lbd_spl, 
+        n_steps, 
+        dt, 
+        initial_distribution, 
+        mu, 
+        sig, 
+        save_states='grid', # can be 'grid', 'event', or 'end'
+        verbose=False, 
+        tqdm_bool=True, 
+        maxiter=1000, 
+        seed=0
+    ):
+
     kappa, k, eps, _, _ = reparameterize(Drho, Dc, T, epsilon, r)
-    # initial conditions
-    lbd_vect_ini, adj_matr_ini = get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, ini_dist_type, seed=seed)
-
-    # initialize variables
-
-    lbd_vect, adj_matr = lbd_vect_ini.copy(), adj_matr_ini.copy()
-    random_uniform = PrecompiledRandomGenerator(100_000, seed=seed)
-
-    # initialize loop variables
-    time_current = 0.0
-        
-    split_times_queue = [n_steps * dt]
-    split_index_queue = [None]
-
-    included_inds = np.arange(stop=len(lbd_vect), dtype=int)
-    finished_bool = False
     
-    _iter = tqdm(range(maxiter), desc='Worst case timer: ') if tqdm_bool else range(maxiter)
-    for _counter in _iter:
-        # check if finished
-        if finished_bool:
-            break
-
-        if verbose: print(f'# active: {np.sum(lbd_vect > 0)}')
-        
-        # evolve and (maybe) be interrupted 
-        sol = solve_ivp(dydt, 
-                        t_span=(time_current, split_times_queue[0]), 
-                        y0=lbd_vect, 
-                        method='BDF',
-                        events=[event_zero, get_event_split(included_inds, adj_matr, kappa, k, eps, lbd_spl)], 
-                        args=(adj_matr, kappa, k, eps, lbd_spl),
-                        jac=jac_dydt,
-                        rtol=1e-6) # also can help: max_step, first_step (parameters)
-        
-        if len(sol.y_events[0] > 0): # merging event
-            # update timing
-            time_current = sol.t_events[0][0]
-
-            if verbose: print(f'Interrupted by negative at {time_current = :.1f}')
-            
-            # perform merge
-            lbd_vect, adj_matr = fix_negative_adaptive(sol.y_events[0][0], adj_matr)
-            adj_matr = csr_matrix(adj_matr.toarray())
-
-            if check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
-                return time_current, True, np.sum(lbd_vect > 0)
-
-        elif len(sol.y_events[1] > 0): # split threshold reached
-            # update timing
-            time_current = sol.t_events[1][0]
-
-            # determine where split happened
-            lbd_vect = sol.y_events[1][0]
-            split_index = np.argmin(np.abs(lbd_vect - lbd_spl))
-            
-            # exclude the split index from split monitoring
-            included_inds = np.delete(included_inds, np.where(included_inds == split_index)[0][0])
-                
-            # sample time-to-split: inv_P(uniform) is a sampled time-to-split (approx)
-            dLambdadt = dydt(0.0, lbd_vect, adj_matr, kappa, k, eps, lbd_spl)[split_index] 
-            split_time = time_current +  np.sqrt(-2 / r / dLambdadt * np.log(1 - random_uniform.get_next()))
-            
-            # add time and split index to split queues
-            split_times_queue, split_index_queue = insert_sorted2(split_times_queue, split_time, split_index_queue, split_index)
-            if verbose: print(f'Interrupted by split at {time_current = :.1f}, {split_index = }, sampled new split time: {split_time:.2f}')
-            
-        else:
-            if split_index_queue[0] != None: # splitting time reached
-                if verbose: print('Integrated until split time')
-                # perform split
-                split_index = split_index_queue.pop(0)
-                lbd_vect, adj_matr = split(split_index, sol.y[:, -1], adj_matr)
-                adj_matr = csr_matrix(adj_matr.toarray())
-                
-                # include the split index to split monitoring
-                included_inds = insert_sorted(included_inds, split_index)
-
-                # remove time from split queue, update times and indices
-                time_current = split_times_queue.pop(0)
-                if check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
-                    return time_current, True, np.sum(lbd_vect > 0)
-
-            else: # final time reached
-                if verbose: print('Finishing up.')
-                finished_bool = True
-
-        _counter += 1
-        if verbose: print(f'excluded indices: {[item for item in np.arange(stop=len(lbd_vect), dtype=int) if item not in included_inds]}')
-        
-    if check_finished(sol.y[:,-1], adj_matr, kappa, k, eps, lbd_spl):
-        return time_current, True, np.sum(lbd_vect > 0)
-    else:
-        return time_current, False, np.sum(lbd_vect > 0)
-
-def evolve_adapt_timestep_equi_time_hardmax(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, n_steps, dt, ini_dist_type, mu, sig, verbose=False, tqdm_bool=True, maxiter=1000, seed=0):
-    kappa, k, eps, _, _ = reparameterize(Drho, Dc, T, epsilon, r)
     # initial conditions
-    lbd_vect_ini, adj_matr_ini = get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, ini_dist_type, seed=seed)
-
-    # initialize variables
-
-    lbd_vect, adj_matr = lbd_vect_ini.copy(), adj_matr_ini.copy()
-    random_uniform = PrecompiledRandomGenerator(100_000, seed=seed)
-
-    # initialize loop variables
-    time_current = 0.0
-        
-    split_times_queue = [n_steps * dt]
-    split_index_queue = [None]
-
-    included_inds = np.arange(stop=len(lbd_vect), dtype=int)
-    finished_bool = False
-    
-    _iter = tqdm(range(maxiter), desc='Worst case timer: ') if tqdm_bool else range(maxiter)
-    for _counter in _iter:
-        # check if finished
-        if finished_bool:
-            break
-
-        if verbose: print(f'# active: {np.sum(lbd_vect > 0)}')
-        
-        # evolve and (maybe) be interrupted 
-        sol = solve_ivp(dydt, 
-                        t_span=(time_current, split_times_queue[0]), 
-                        y0=lbd_vect, 
-                        method='BDF',
-                        events=[event_zero, get_event_split(included_inds, adj_matr, kappa, k, eps, lbd_spl), get_event_split_hard(adj_matr, kappa, k, eps, 4/3*lbd_spl)], 
-                        args=(adj_matr, kappa, k, eps, lbd_spl),
-                        jac=jac_dydt,
-                        rtol=1e-6) # also can help: max_step, first_step (parameters)
-        
-        if len(sol.y_events[0] > 0): # merging event
-            # update timing
-            time_current = sol.t_events[0][0]
-
-            if verbose: print(f'Interrupted by negative at {time_current = :.1f}')
-            
-            # perform merge
-            lbd_vect, adj_matr = fix_negative_adaptive(sol.y_events[0][0], adj_matr)
-            adj_matr = csr_matrix(adj_matr.toarray())
-            if check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
-                return time_current, True, np.sum(lbd_vect > 0)
-
-        elif len(sol.y_events[1] > 0): # split threshold reached
-            # update timing
-            time_current = sol.t_events[1][0]
-
-            # determine where split happened
-            lbd_vect = sol.y_events[1][0]
-            split_index = np.argmin(np.abs(lbd_vect - lbd_spl))
-            
-            # exclude the split index from split monitoring
-            included_inds = np.delete(included_inds, np.where(included_inds == split_index)[0][0])
-                
-            # sample time-to-split: inv_P(uniform) is a sampled time-to-split (approx)
-            dLambdadt = dydt(0.0, lbd_vect, adj_matr, kappa, k, eps, lbd_spl)[split_index] 
-            split_time = time_current +  np.sqrt(-2 / r / dLambdadt * np.log(1 - random_uniform.get_next()))
-            
-            # add time and split index to split queues
-            split_times_queue, split_index_queue = insert_sorted2(split_times_queue, split_time, split_index_queue, split_index)
-            if verbose: print(f'Interrupted by split at {time_current = :.1f}, {split_index = }, sampled new split time: {split_time:.2f}')
-            
-        elif len(sol.y_events[2] > 0): # hard split threshold reached
-            # update timing
-            time_current = sol.t_events[2][0]
-
-            # determine where hard split happened & split
-            lbd_vect = sol.y_events[2][0]
-            split_index = np.argmin(np.abs(lbd_vect - 4/3*lbd_spl))
-            lbd_vect, adj_matr = split(split_index, sol.y_events[2][0], adj_matr)
-            adj_matr = csr_matrix(adj_matr.toarray())
-            
-            # find the split index in the splitting queue
-            ind_ind = split_index_queue.index(split_index)
-            # exclude it from the queue
-            split_index_queue.pop(ind_ind)
-            # exclude the previously sampled split time 
-            split_times_queue.pop(ind_ind)
-
-            # include the split index to split monitoring
-            included_inds = insert_sorted(included_inds, split_index)
-
-            if check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
-                return time_current, True, np.sum(lbd_vect > 0)
-
-        else:
-            if split_index_queue[0] != None: # splitting time reached
-                if verbose: print('Integrated until split time')
-                # perform split
-                split_index = split_index_queue.pop(0)
-                lbd_vect, adj_matr = split(split_index, sol.y[:, -1], adj_matr)
-                adj_matr = csr_matrix(adj_matr.toarray())
-                
-                # include the split index to split monitoring
-                included_inds = insert_sorted(included_inds, split_index)
-
-                # remove time from split queue, update times and indices
-                time_current = split_times_queue.pop(0)
-                if check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
-                    return time_current, True, np.sum(lbd_vect > 0)
-
-            else: # final time reached
-                if verbose: print('Finishing up.')
-                finished_bool = True
-
-        _counter += 1
-        if verbose: print(f'excluded indices: {[item for item in np.arange(stop=len(lbd_vect), dtype=int) if item not in included_inds]}')
-        
-    if check_finished(sol.y[:,-1], adj_matr, kappa, k, eps, lbd_spl):
-        return time_current, True, np.sum(lbd_vect > 0)
-    else:
-        return time_current, False, np.sum(lbd_vect > 0)
-
-
-def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, n_steps, dt, ini_dist_type, mu, sig, save_bool=False, verbose=False, tqdm_bool=True, maxiter=1000, seed=0):
-    
-    kappa, k, eps, _, _ = reparameterize(Drho, Dc, T, epsilon, r)
-    # initial conditions
-    lbd_vect_ini, adj_matr_ini = get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, ini_dist_type, seed=seed)
+    lbd_vect_ini, adj_matr_ini = get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, initial_distribution, seed=seed)
 
     # initialize save variables
-    if save_bool:
-        t_range = np.arange(0, dt * n_steps, dt)
-        lbd_vect_t = np.zeros((Nmax, n_steps))
-        adj_matr_t = np.zeros((n_steps), dtype=object)
+    if save_states == 'grid':
+        t_range, lbd_vect_t, adj_matr_t = np.arange(0, dt * n_steps, dt), np.zeros((Nmax, n_steps)), np.zeros((n_steps), dtype=object)
         lbd_vect_t[:, 0] = lbd_vect_ini.copy()
         adj_matr_t[0] = adj_matr_ini.copy()
+    elif save_states == 'event':
+        t_range, lbd_vect_t, adj_matr_t = [0.0], [lbd_vect_ini.copy()], [adj_matr_ini.copy()] # np.arange(0, dt * n_steps, dt), np.zeros((Nmax, n_steps)), np.zeros((n_steps), dtype=object)
+    else:
+        t_range, lbd_vect_t, adj_matr_t = [0.0], [lbd_vect_ini.copy()], [adj_matr_ini.copy()] # np.arange(0, dt * n_steps, dt), np.zeros((Nmax, n_steps)), np.zeros((n_steps), dtype=object)
 
-    lbd_vect, adj_matr = lbd_vect_ini.copy(), adj_matr_ini.copy()
     random_uniform = PrecompiledRandomGenerator(100_000, seed=seed)
 
     # initialize loop variables
+    lbd_vect, adj_matr = lbd_vect_ini.copy(), adj_matr_ini.copy()
     time_current = 0.0
     ind_current_lo = 0
     ind_current_hi = n_steps
@@ -783,7 +336,7 @@ def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, 
         if finished_bool:
             break
 
-        if save_bool:
+        if save_states == 'grid':
             if _counter == 0:
                 t_eval_current = t_range
             else:
@@ -800,22 +353,28 @@ def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, 
                         t_span=(time_current, split_times_queue[0]), 
                         y0=lbd_vect, 
                         method='BDF',
-                        t_eval=t_eval_current if save_bool else None, 
-                        events=[event_zero] + [get_event_split(np.where(lbd_vect > lbd_spl)[0], adj_matr, kappa, k, eps, lbd_spl)] + [get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl) for ind in included_inds if ind not in split_index_queue], 
+                        t_eval=t_eval_current if save_states == 'grid' else None, 
+                        events=[event_zero] + [get_event_split(np.where(lbd_vect > lbd_spl)[0], adj_matr, kappa, k, eps, 1.5*lbd_spl)] + [get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl) for ind in included_inds if ind not in split_index_queue], 
                         args=(adj_matr, kappa, k, eps, lbd_spl),
                         jac=jac_dydt,
                         rtol=1e-6) # also can help: max_step (parameter)
         
         if sol.status == -1:
-            print(f'Solver failed. Message: {sol.message}.\n{sol}')
+            if verbose: print(f'Solver failed. Message: {sol.message}.\n{sol}')
+            raise ValueError(f'Solver failed. Message: {sol.message}.')
 
         elif sol.status == 1:
             # determine which event happened
-            event_ind = [ind for ind in np.arange(1 + 1 + len(included_inds) - (len(split_index_queue) - 1), dtype=int) if len(sol.y_events[ind]) > 0][0]
+            event_ind = [ind for ind in np.arange(1 + 1 + len(included_inds) - len(split_index_queue) + 1, dtype=int) if len(sol.y_events[ind]) > 0][0]
 
-            if save_bool:
+            if save_states == 'grid':
                 lbd_vect_t[:, ind_current_lo:int(sol.t_events[event_ind][0] / dt) + 1] = sol.y[:, min(_counter, 1):]
                 adj_matr_t[ind_current_lo:int(sol.t_events[event_ind][0] / dt) + 1] = adj_matr.copy()
+            
+            elif save_states == 'event':
+                t_range.append(sol.t_events[event_ind][0])
+                lbd_vect_t.append(sol.y_events[event_ind][0])
+                adj_matr_t.append(adj_matr.copy())
                 
             # update timing
             time_current = sol.t_events[event_ind][0]
@@ -828,11 +387,45 @@ def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, 
                 # perform merge
                 lbd_vect, adj_matr = fix_negative_adaptive(lbd_vect, adj_matr)
 
+                # when merging happens at Lambda_int > 0, a Lambda can jump the split threshold
+                new_split_inds = set(np.where(lbd_vect > lbd_spl)[0]) - set(split_index_queue)
+                for split_index in new_split_inds:
+                    # sample time-to-split: inv_P(uniform) is a sampled time-to-split (approx)
+                    dLambdadt = max(dydt(0.0, lbd_vect, adj_matr, kappa, k, eps, lbd_spl)[split_index], 1e-9)
+                    split_time = time_current + np.sqrt(-2 / r / dLambdadt * np.log(1 - random_uniform.get_next()))
+                    
+                    # add time and split index to split queues
+                    split_times_queue, split_index_queue = insert_sorted2(split_times_queue, split_time, split_index_queue, split_index)
+                    
+                    if verbose: print(f'A split also happened at {time_current = :.1f}, {split_index = }, sampled new split time: {split_time:.2f}')
+
+                    # update first expected time of split
+                    ind_current_hi = int(split_times_queue[0] / dt) + 1
+
+                # same for hard split
+                new_hard_split_inds = np.where(lbd_vect > 1.5*lbd_spl)[0]
+                for split_index in new_hard_split_inds:
+                    # and split
+                    lbd_vect, adj_matr = split(split_index, lbd_vect, adj_matr)
+                    
+                    # find the split index in the splitting queue
+                    ind_ind = split_index_queue.index(split_index)
+                    # exclude it from the queue
+                    split_index_queue.pop(ind_ind)
+                    # exclude the previously sampled split time 
+                    split_times_queue.pop(ind_ind)
+
+                    # possibly fix ind_current_hi
+                    ind_current_hi = int(split_times_queue[0] / dt) + 1
+
+                    # after splitting there are more plateaus
+                    included_inds = [ind for ind in np.arange(stop=len(lbd_vect), dtype=int) if lbd_vect[ind] > 0.0]                    
+                    if verbose: print(f'A hard split also happened at {time_current = :.1f}, {split_index = }, sampled new split time: {split_time:.2f}')
+
             elif event_ind == 1: # hard split event
                 if verbose: print(f'Interrupted by hard split at {time_current = :.1f}')
-                print(f'{split_index_queue = }, {lbd_vect }')
-                # determine where split happened
-                split_index = np.argmin(np.abs(lbd_vect - 4/3*lbd_spl))
+                # determine where split happened and split
+                split_index = np.argmin(np.abs(lbd_vect - 1.5*lbd_spl))
                 lbd_vect, adj_matr = split(split_index, lbd_vect, adj_matr)
                 
                 # find the split index in the splitting queue
@@ -852,9 +445,6 @@ def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, 
                 # determine where split happened
                 split_index = [ind for ind in included_inds if ind not in split_index_queue][event_ind - 2]
                 
-                # exclude the split index from split monitoring
-                # included_inds = np.delete(included_inds, np.where(included_inds == split_index)[0][0])
-                    
                 # sample time-to-split: inv_P(uniform) is a sampled time-to-split (approx)
                 dLambdadt = dydt(0.0, lbd_vect, adj_matr, kappa, k, eps, lbd_spl)[split_index] 
                 split_time = time_current + np.sqrt(-2 / r / dLambdadt * np.log(1 - random_uniform.get_next()))
@@ -866,17 +456,25 @@ def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, 
                 # update first expected time of split
                 ind_current_hi = int(split_times_queue[0] / dt) + 1
             
-            if not save_bool and check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
-                return time_current, True, np.sum(lbd_vect > 0)
+            # for event based saving, also save after event
+            if save_states == 'event':
+                t_range.append(sol.t_events[event_ind][0])
+                lbd_vect_t.append(sol.y_events[event_ind][0])
+                adj_matr_t.append(adj_matr.copy())
 
         elif sol.status == 0:
             finished_bool = split_index_queue[0] == None # if no more splitting left we are done
 
-            if save_bool:
+            if save_states == 'grid':
                 lbd_vect_t[:, ind_current_lo:ind_current_hi] = sol.y[:, min(_counter, 1):] if finished_bool else sol.y[:, min(_counter, 1):-1]
                 adj_matr_t[ind_current_lo:ind_current_hi] = adj_matr.copy()
-
+            
             if not finished_bool: # splitting time reached
+                if save_states == 'event':
+                    t_range.append(sol.t[-1])
+                    lbd_vect_t.append(sol.y[:, -1])
+                    adj_matr_t.append(adj_matr.copy())
+
                 if verbose: print('Integrated until split time')
                 # perform split
                 split_index = split_index_queue.pop(0)
@@ -889,20 +487,163 @@ def evolve_adapt_timestep_smart(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, 
 
                 # after splitting there are more plateaus
                 included_inds = [ind for ind in np.arange(stop=len(lbd_vect), dtype=int) if lbd_vect[ind] > 0.0]
+                        
+                # for event based saving, also save after event
+                if save_states == 'event':
+                    t_range.append(sol.t[-1])
+                    lbd_vect_t.append(lbd_vect)
+                    adj_matr_t.append(adj_matr.copy())
 
-            if not save_bool and check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
-                return time_current, True, np.sum(lbd_vect > 0)
-            
         _counter += 1
         if verbose: print(f'excluded indices: {[item for item in np.arange(stop=len(lbd_vect), dtype=int) if item not in included_inds]}')
     
-    if save_bool:
-        return t_range, lbd_vect_t, adj_matr_t
+    return t_range, lbd_vect_t, adj_matr_t
+
+def evolve_adapt_timestep_hard_split(
+        Nmax, 
+        L_full, 
+        Drho, 
+        Dc, 
+        T, 
+        epsilon, 
+        r, 
+        lbd_spl, 
+        n_steps, 
+        dt, 
+        initial_distribution, 
+        mu, 
+        sig, 
+        save_states='grid', # can be 'grid', 'event', or 'end'
+        verbose=False, 
+        tqdm_bool=True, 
+        maxiter=1000, 
+        seed=0
+    ):
+
+    kappa, k, eps, _, _ = reparameterize(Drho, Dc, T, epsilon, r)
+    
+    # initial conditions
+    lbd_vect_ini, adj_matr_ini = get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, initial_distribution, seed=seed)
+
+    # initialize save variables
+    if save_states == 'grid':
+        t_range, lbd_vect_t, adj_matr_t = np.arange(0, dt * n_steps, dt), np.zeros((Nmax, n_steps)), np.zeros((n_steps), dtype=object)
+        lbd_vect_t[:, 0] = lbd_vect_ini.copy()
+        adj_matr_t[0] = adj_matr_ini.copy()
+    elif save_states == 'event':
+        t_range, lbd_vect_t, adj_matr_t = [0.0], [lbd_vect_ini.copy()], [adj_matr_ini.copy()] # np.arange(0, dt * n_steps, dt), np.zeros((Nmax, n_steps)), np.zeros((n_steps), dtype=object)
     else:
-        if check_finished(sol.y[:,-1], adj_matr, kappa, k, eps, lbd_spl):
-            return time_current, True, np.sum(lbd_vect > 0)
-        else:
-            return time_current, False, np.sum(lbd_vect > 0)
+        t_range, lbd_vect_t, adj_matr_t = [0.0], [lbd_vect_ini.copy()], [adj_matr_ini.copy()] # np.arange(0, dt * n_steps, dt), np.zeros((Nmax, n_steps)), np.zeros((n_steps), dtype=object)
+
+    # initialize loop variables
+    lbd_vect, adj_matr = lbd_vect_ini.copy(), adj_matr_ini.copy()
+    time_current = 0.0
+    ind_current_lo = 0
+    ind_current_hi = n_steps
+        
+    included_inds = [ind for ind in np.arange(stop=len(lbd_vect), dtype=int) if lbd_vect[ind] > 0.0]
+    finished_bool = False
+    
+    _iter = tqdm(range(maxiter), desc='Worst case timer: ') if tqdm_bool else range(maxiter)
+    for _counter in _iter:
+        # check if finished
+        if finished_bool:
+            break
+
+        if save_states == 'grid':
+            if _counter == 0:
+                t_eval_current = t_range
+            else:
+                # insert current time to evaluation array to ensure potential event occurs on the evaluated interval
+                t_eval_current = np.insert(t_range[ind_current_lo:ind_current_hi], 0, time_current)
+                
+        if verbose: print(f'# active: {np.sum(lbd_vect > 0)}')
+        
+        # evolve and (maybe) be interrupted 
+        sol = solve_ivp(dydt, 
+                        t_span=(time_current, dt * n_steps), 
+                        y0=lbd_vect, 
+                        method='BDF',
+                        t_eval=t_eval_current if save_states == 'grid' else None, 
+                        events=[event_zero] + [get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl) for ind in included_inds], 
+                        args=(adj_matr, kappa, k, eps, lbd_spl),
+                        jac=jac_dydt,
+                        rtol=1e-6) # also can help: max_step (parameter)
+        
+        if sol.status == -1:
+            if verbose: print(f'Solver failed. Message: {sol.message}.\n{sol}')
+            raise ValueError(f'Solver failed. Message: {sol.message}.')
+
+        elif sol.status == 1:
+            # determine which event happened
+            event_ind = [ind for ind in np.arange(1 + len(included_inds), dtype=int) if len(sol.y_events[ind]) > 0][0]
+
+            if save_states == 'grid':
+                lbd_vect_t[:, ind_current_lo:int(sol.t_events[event_ind][0] / dt) + 1] = sol.y[:, min(_counter, 1):]
+                adj_matr_t[ind_current_lo:int(sol.t_events[event_ind][0] / dt) + 1] = adj_matr.copy()
+            
+            elif save_states == 'event':
+                t_range.append(sol.t_events[event_ind][0])
+                lbd_vect_t.append(sol.y_events[event_ind][0])
+                adj_matr_t.append(adj_matr.copy())
+                
+            # update timing
+            time_current = sol.t_events[event_ind][0]
+            ind_current_lo = int(time_current / dt) + 1
+            lbd_vect = sol.y_events[event_ind][0]
+
+            if event_ind == 0: # merging event
+                if verbose: print(f'Interrupted by merge at {time_current = :.1f}')
+                
+                # perform merge
+                lbd_vect, adj_matr = fix_negative_adaptive(lbd_vect, adj_matr)
+
+                # when merging happens at Lambda_int > 0, a Lambda can jump the split threshold
+                new_split_inds = set(np.where(lbd_vect > lbd_spl)[0])
+                for split_index in new_split_inds:
+                    # and split
+                    lbd_vect, adj_matr = split(split_index, lbd_vect, adj_matr)
+                    
+                    # after splitting there are more plateaus
+                    included_inds = [ind for ind in np.arange(stop=len(lbd_vect), dtype=int) if lbd_vect[ind] > 0.0]                    
+                    if verbose: print(f'A hard split happened at {time_current = :.1f}, {split_index = }')
+
+            elif event_ind == 1: # hard split event
+                if verbose: print(f'Interrupted by hard split at {time_current = :.1f}')
+                # determine where split happened and split
+                split_index = np.argmin(np.abs(lbd_vect - 1.5*lbd_spl))
+                lbd_vect, adj_matr = split(split_index, lbd_vect, adj_matr)
+                
+                # after splitting there are more plateaus
+                included_inds = [ind for ind in np.arange(stop=len(lbd_vect), dtype=int) if lbd_vect[ind] > 0.0]
+
+            else: # split threshold reached
+                if verbose: print(f'Interrupted by hard split at {time_current = :.1f}')
+                # determine where split happened and split
+                split_index = included_inds[event_ind - 1]
+                lbd_vect, adj_matr = split(split_index, lbd_vect, adj_matr)
+                
+                # after splitting there are more plateaus
+                included_inds = [ind for ind in np.arange(stop=len(lbd_vect), dtype=int) if lbd_vect[ind] > 0.0]
+            
+            # for event based saving, also save after event
+            if save_states == 'event':
+                t_range.append(sol.t_events[event_ind][0])
+                lbd_vect_t.append(sol.y_events[event_ind][0])
+                adj_matr_t.append(adj_matr.copy())
+
+        elif sol.status == 0:
+            finished_bool = True # if no more splitting left we are done
+
+            if save_states == 'grid':
+                lbd_vect_t[:, ind_current_lo:ind_current_hi] = sol.y[:, min(_counter, 1):] if finished_bool else sol.y[:, min(_counter, 1):-1]
+                adj_matr_t[ind_current_lo:ind_current_hi] = adj_matr.copy()
+            
+
+        _counter += 1
+        if verbose: print(f'excluded indices: {[item for item in np.arange(stop=len(lbd_vect), dtype=int) if item not in included_inds]}')
+    
+    return t_range, lbd_vect_t, adj_matr_t
 
 
 # document
