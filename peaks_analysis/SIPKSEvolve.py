@@ -18,9 +18,9 @@ def shuffle_nonzero_elements(arr, seed=0):
     arr[mask] = arr_masked
     return arr.copy()
 
-def get_MF_samples(num_samples, Drho, Dc, T, epsilon, r, lbd_spl, dx=1e-4, lbd_max=30, tol=1e-12, seed=0):
+def get_MF_samples(num_samples, KS_params, r, lbd_spl, dx=1e-4, lbd_max=30, tol=1e-12, seed=0):
 
-    kappa, k, eps, _, r = reparameterize(Drho, Dc, T, epsilon, r)
+    kappa, k, eps = reparameterize(*KS_params)
 
     # get steady state. Expected usage makes this computationally relatively inexpensive, so use low tolerance
     x_range, P_range = get_P_ss(lbd_max, kappa, k, eps, lbd_spl, r, dx, tol, verbose=False)
@@ -42,44 +42,60 @@ def get_MF_samples(num_samples, Drho, Dc, T, epsilon, r, lbd_spl, dx=1e-4, lbd_m
 
     return np.array(samples)
 
-def get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, initial_distribution='chaos', seed=0):
-
-    if initial_distribution == 'gauss':
-        np.random.seed(seed)
-        lbd_vect = mu + sig * np.random.randn(Nmax)
-    elif initial_distribution == 'chaos':
-        lbd_vect = get_MF_samples(Nmax, Drho, Dc, T, epsilon, r, lbd_spl, seed=seed)
-       
-    too_big_inds = np.where(np.cumsum(lbd_vect) > L_full)[0]
-    lbd_vect[too_big_inds] = 0.0
-    lbd_vect[too_big_inds[0]] = L_full - np.sum(lbd_vect)
-
+def get_adj_matr_ini(Nmax, n_active, boundary_condition='periodic'):
     adj_matr = np.zeros((Nmax, Nmax), dtype=int)
+    if boundary_condition == 'periodic':
+        for i in range(n_active):
+            adj_matr[i, i] = -2
+            adj_matr[(i+1)%n_active, i] = 1
+            adj_matr[i, (i+1)%n_active] = 1
+    elif boundary_condition == 'neumann':
+        adj_matr[0,0] = adj_matr[n_active-1, n_active-1] = -1
+        adj_matr[0,1] = adj_matr[1,0] = 1
+        for i in range(1,n_active-1):
+            adj_matr[i, i] = -2
+            adj_matr[i+1, i] = 1
+            adj_matr[i, i+1] = 1
+    else:
+         raise ValueError(f'Unimplemented boundary conditions: {boundary_condition}')
+    return csr_matrix(adj_matr)
 
-    # prepare initials
-    for i in range(Nmax):
-        if lbd_vect[i] != 0.0:
-            if i == 0:
-                adj_matr[i, i+1] = 1
-                adj_matr[i, i] = -1
-            else:
-                adj_matr[i, i+1] = 1
-                adj_matr[i, i] = -2
-                adj_matr[i, i-1] = 1
-        
-        else:
-            adj_matr[i-1, i-1] += 1
-            adj_matr[i-1, i] += -1
-            break
+def get_initial_state_chaos(Nmax, L_full, KS_params, r, lbd_spl, merge_threshold=1e-1, boundary_condition='periodic', seed=0):
+    
+    lbd_vect_ini = get_MF_samples(Nmax, KS_params, r, lbd_spl, seed=seed)
+       
+    too_big_inds = np.where(np.cumsum(lbd_vect_ini) > L_full)[0]
+    lbd_vect_ini[too_big_inds] = 0.0
+    lbd_vect_ini[too_big_inds[0]] = L_full - np.sum(lbd_vect_ini)
 
-    lbd_vect_ini, adj_matr_ini = lbd_vect, csr_matrix(adj_matr)
+    adj_matr_ini = get_adj_matr_ini(Nmax, np.sum(lbd_vect_ini > 0), boundary_condition)
 
     # presplit
     while np.any(lbd_vect_ini > lbd_spl):
         lbd_vect_ini, adj_matr_ini = split(np.where(lbd_vect_ini > lbd_spl)[0][0], lbd_vect_ini, adj_matr_ini)
     # make sure all positive
     while np.any(lbd_vect_ini < 0):
-        lbd_vect_ini, adj_matr_ini = fix_negative(lbd_vect_ini, adj_matr_ini)
+        lbd_vect_ini, adj_matr_ini = merge(lbd_vect_ini, adj_matr_ini, merge_threshold)
+
+    return shuffle_nonzero_elements(lbd_vect_ini, seed=seed), adj_matr_ini
+
+def get_initial_state_gauss(Nmax, L_full, lbd_spl, mu, sig, merge_threshold=1e-1, boundary_condition='periodic', seed=0):
+
+    rng = np.random.default_rng(seed)
+    lbd_vect_ini = mu + sig * rng.standard_normal(Nmax)
+       
+    too_big_inds = np.where(np.cumsum(lbd_vect_ini) > L_full)[0]
+    lbd_vect_ini[too_big_inds] = 0.0
+    lbd_vect_ini[too_big_inds[0]] = L_full - np.sum(lbd_vect_ini)
+
+    adj_matr_ini = get_adj_matr_ini(Nmax, np.sum(lbd_vect_ini > 0), boundary_condition)
+
+    # presplit
+    while np.any(lbd_vect_ini > lbd_spl):
+        lbd_vect_ini, adj_matr_ini = split(np.where(lbd_vect_ini > lbd_spl)[0][0], lbd_vect_ini, adj_matr_ini)
+    # make sure all positive
+    while np.any(lbd_vect_ini < 0):
+        lbd_vect_ini, adj_matr_ini = merge(lbd_vect_ini, adj_matr_ini, merge_threshold)
 
     return shuffle_nonzero_elements(lbd_vect_ini, seed=seed), adj_matr_ini
 
@@ -120,50 +136,48 @@ def split(ind_split, lbd_vect, adj_matr):
 def sparse_find_neighbors(sparse_adj_matr, node):
     return sparse_adj_matr[node].indices[sparse_adj_matr[node].data == 1]
 
-def fix_negative(lbd_vect, adj_matr):
-    while np.any(lbd_vect < 0): # here can put some constant to make it faster
-        ind_negative = np.argmin(lbd_vect)
-        inds_neighbors = sparse_find_neighbors(adj_matr, ind_negative) 
-        if len(inds_neighbors) == 2:
-            ind_neighbor1 = inds_neighbors[0]
-            ind_neighbor2 = inds_neighbors[1]
+# def merge(lbd_vect, adj_matr):
+#     while np.any(lbd_vect < 0): # here can put some constant to make it faster
+#         ind_negative = np.argmin(lbd_vect)
+#         inds_neighbors = sparse_find_neighbors(adj_matr, ind_negative) 
+#         if len(inds_neighbors) == 2:
+#             ind_neighbor1 = inds_neighbors[0]
+#             ind_neighbor2 = inds_neighbors[1]
             
-            adj_matr[ind_neighbor1, ind_neighbor2] = 1
-            adj_matr[ind_neighbor2, ind_neighbor1] = 1
+#             adj_matr[ind_neighbor1, ind_neighbor2] = 1
+#             adj_matr[ind_neighbor2, ind_neighbor1] = 1
             
-            adj_matr[ind_neighbor1, ind_negative] = 0
-            adj_matr[ind_negative, ind_neighbor1] = 0
+#             adj_matr[ind_neighbor1, ind_negative] = 0
+#             adj_matr[ind_negative, ind_neighbor1] = 0
             
-            adj_matr[ind_negative, ind_neighbor2] = 0
-            adj_matr[ind_neighbor2, ind_negative] = 0
+#             adj_matr[ind_negative, ind_neighbor2] = 0
+#             adj_matr[ind_neighbor2, ind_negative] = 0
 
-            adj_matr[ind_negative, ind_negative] = 0
+#             adj_matr[ind_negative, ind_negative] = 0
 
-            lbd_vect[ind_neighbor1] += 0.5 * lbd_vect[ind_negative]
-            lbd_vect[ind_neighbor2] += 0.5 * lbd_vect[ind_negative]
+#             lbd_vect[ind_neighbor1] += 0.5 * lbd_vect[ind_negative]
+#             lbd_vect[ind_neighbor2] += 0.5 * lbd_vect[ind_negative]
 
-        elif len(inds_neighbors) == 1:
-            ind_neighbor1 = inds_neighbors[0]
+#         elif len(inds_neighbors) == 1:
+#             ind_neighbor1 = inds_neighbors[0]
             
-            adj_matr[ind_neighbor1, ind_negative] = 0
-            adj_matr[ind_negative, ind_neighbor1] = 0
+#             adj_matr[ind_neighbor1, ind_negative] = 0
+#             adj_matr[ind_negative, ind_neighbor1] = 0
             
-            adj_matr[ind_negative, ind_negative] = 0
-            adj_matr[ind_neighbor1, ind_neighbor1] = -1
+#             adj_matr[ind_negative, ind_negative] = 0
+#             adj_matr[ind_neighbor1, ind_neighbor1] = -1
 
-            lbd_vect[ind_neighbor1] += lbd_vect[ind_negative]
+#             lbd_vect[ind_neighbor1] += lbd_vect[ind_negative]
 
-        else:
-            raise ValueError(f"Adjacency matrix has {len(inds_neighbors)} neighbors. ")
+#         else:
+#             raise ValueError(f"Adjacency matrix has {len(inds_neighbors)} neighbors. ")
 
-        # set lbd_vect
-        lbd_vect[ind_negative] = 0
-        adj_matr[ind_negative, ind_negative] = 0
+#         # set lbd_vect
+#         lbd_vect[ind_negative] = 0
+#         adj_matr[ind_negative, ind_negative] = 0
 
-    return lbd_vect, adj_matr
+#     return lbd_vect, adj_matr
 
-def g(lbd, kappa, k, eps):
-    return 0.5 * (kappa * np.exp(-k * lbd) + eps * lbd)
 
 class PrecompiledRandomGenerator:
     def __init__(self, n, seed):
@@ -180,28 +194,23 @@ class PrecompiledRandomGenerator:
         return self.prepared_numbers[self.index]    
 
 # functions - adaptive step size
-def dydt(t, y, adj_matr, kappa, k, eps, lbd_spl): # number of additional arguments to conform to the solve_ivp
-    return adj_matr @ g(y, kappa, k, eps)
+def get_event_merge(merge_threshold):
 
-def g_prime(lbd, kappa, k, eps):
-    return 0.5 * (-k * kappa * np.exp(-k * lbd) + eps)
+    def event_merge(t, y, adj_matr):
+        return np.min(y[y != 0]) - merge_threshold
+    
+    event_merge.terminal = True
+    event_merge.direction = -1
 
-def jac_dydt(t, y, adj_matr, kappa, k, eps, lbd_spl):
-    return adj_matr @ np.diag(g_prime(y, kappa, k, eps))
+    return event_merge
 
-def event_zero(t, y, adj_matr, kappa, k, eps, lbd_spl):
-    return np.min(y[y != 0]) - 1e-1
-
-event_zero.terminal = True
-event_zero.direction = -1
-
-def get_event_split(included_inds, adj_matr, kappa, k, eps, lbd_spl):
+def get_event_split(included_inds, lbd_spl):
 
     if len(included_inds) == 0:
-        def event_split(t, y, adj_matr, kappa, k, eps, lbd_spl):
+        def event_split(t, y, adj_matr):
             return -1
     else:
-        def event_split(t, y, adj_matr, kappa, k, eps, lbd_spl):
+        def event_split(t, y, adj_matr):
             return np.max(y[included_inds] - lbd_spl)
     
     event_split.terminal = True
@@ -209,8 +218,8 @@ def get_event_split(included_inds, adj_matr, kappa, k, eps, lbd_spl):
 
     return event_split
 
-def get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl):
-    def event_split(t, y, adj_matr, kappa, k, eps, lbd_spl):
+def get_event_split_single(ind, lbd_spl):
+    def event_split(t, y, adj_matr):
         return y[ind] - lbd_spl
     
     event_split.terminal = True
@@ -218,9 +227,9 @@ def get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl):
 
     return event_split
 
-def fix_negative_adaptive(lbd_vect, adj_matr):
-    while np.any(np.isclose(lbd_vect[lbd_vect != 0.0], 1e-1)):
-        ind_negative = np.where(np.logical_and(np.isclose(lbd_vect, 1e-1), lbd_vect != 0.0))[0][0]
+def merge(lbd_vect, adj_matr, merge_threshold):
+    while np.any(np.isclose(lbd_vect, merge_threshold)):
+        ind_negative = np.where(np.logical_and(np.isclose(lbd_vect, merge_threshold), lbd_vect != 0.0))[0][0]
 
         inds_neighbors = sparse_find_neighbors(adj_matr, ind_negative) 
         if len(inds_neighbors) == 2:
@@ -273,42 +282,34 @@ def insert_sorted2(arr, element, arr2, element2):
     
     return arr, arr2
 
-# equilibriation time functions
-def check_finished(lbd_vect, adj_matr, kappa, k, eps, lbd_spl):
-    lbd_max = -1/k * np.log(eps/k/kappa)
-    in_interval_bool = np.all(np.logical_and(lbd_vect > lbd_max, lbd_vect < lbd_spl), where=lbd_vect>0)
-    contracting_bool = np.sum((lbd_vect - np.mean(lbd_vect, where=lbd_vect>0)) * dydt(0.0, lbd_vect, adj_matr, kappa, k, eps, lbd_spl)) < 0
-    return in_interval_bool and contracting_bool
-
 def evolve_adapt_timestep(
-        Nmax, 
-        L_full, 
-        Drho, 
-        Dc, 
-        T, 
-        epsilon, 
+        lbd_vect_ini, 
+        adj_matr_ini,
+        KS_params,
         r, 
         lbd_spl, 
         n_steps, 
         dt, 
-        initial_distribution, 
-        mu, 
-        sig, 
+        lbd_spl_hard, 
+        merge_threshold=1e-1,
         save_states='grid', # can be 'grid', 'event', or 'end'
         verbose=False, 
         tqdm_bool=True, 
-        maxiter=1000, 
+        maxiter=1_000, 
         seed=0
     ):
 
-    kappa, k, eps, _, _ = reparameterize(Drho, Dc, T, epsilon, r)
-    
-    # initial conditions
-    lbd_vect_ini, adj_matr_ini = get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, initial_distribution, seed=seed)
+    kappa, k, eps = reparameterize(*KS_params)
+
+    def dydt(t, y, adj_matr): # number of additional arguments to conform to the solve_ivp
+        return 0.5 * adj_matr @ (kappa * np.exp(-k * y) + eps * y)
+
+    def jac_dydt(t, y, adj_matr):
+        return 0.5 * adj_matr @ np.diag((-k * kappa * np.exp(-k * y) + eps))
 
     # initialize save variables
     if save_states == 'grid':
-        t_range, lbd_vect_t, adj_matr_t = np.arange(0, dt * n_steps, dt), np.zeros((Nmax, n_steps)), np.zeros((n_steps), dtype=object)
+        t_range, lbd_vect_t, adj_matr_t = np.arange(0, dt * n_steps, dt), np.zeros((len(lbd_vect_ini), n_steps)), np.zeros((n_steps), dtype=object)
         lbd_vect_t[:, 0] = lbd_vect_ini.copy()
         adj_matr_t[0] = adj_matr_ini.copy()
     elif save_states == 'event':
@@ -354,10 +355,11 @@ def evolve_adapt_timestep(
                         y0=lbd_vect, 
                         method='BDF',
                         t_eval=t_eval_current if save_states == 'grid' else None, 
-                        events=[event_zero] + [get_event_split(np.where(lbd_vect > lbd_spl)[0], adj_matr, kappa, k, eps, 1.5*lbd_spl)] + [get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl) for ind in included_inds if ind not in split_index_queue], 
-                        args=(adj_matr, kappa, k, eps, lbd_spl),
+                        events=[get_event_merge(merge_threshold)] + [get_event_split(np.where(lbd_vect > lbd_spl)[0], lbd_spl_hard)] + [get_event_split_single(ind, lbd_spl) for ind in included_inds if ind not in split_index_queue], 
+                        args=[adj_matr],
                         jac=jac_dydt,
-                        rtol=1e-6) # also can help: max_step (parameter)
+                        rtol=1e-3, 
+                        atol=1e-5) # also can help: max_step (parameter)
         
         if sol.status == -1:
             if verbose: print(f'Solver failed. Message: {sol.message}.\n{sol}')
@@ -385,13 +387,13 @@ def evolve_adapt_timestep(
                 if verbose: print(f'Interrupted by merge at {time_current = :.1f}')
                 
                 # perform merge
-                lbd_vect, adj_matr = fix_negative_adaptive(lbd_vect, adj_matr)
+                lbd_vect, adj_matr = merge(lbd_vect, adj_matr, merge_threshold)
 
                 # when merging happens at Lambda_int > 0, a Lambda can jump the split threshold
                 new_split_inds = set(np.where(lbd_vect > lbd_spl)[0]) - set(split_index_queue)
                 for split_index in new_split_inds:
                     # sample time-to-split: inv_P(uniform) is a sampled time-to-split (approx)
-                    dLambdadt = max(dydt(0.0, lbd_vect, adj_matr, kappa, k, eps, lbd_spl)[split_index], 1e-9)
+                    dLambdadt = max(dydt(0.0, lbd_vect, adj_matr)[split_index], 1e-9)
                     split_time = time_current + np.sqrt(-2 / r / dLambdadt * np.log(1 - random_uniform.get_next()))
                     
                     # add time and split index to split queues
@@ -403,7 +405,7 @@ def evolve_adapt_timestep(
                     ind_current_hi = int(split_times_queue[0] / dt) + 1
 
                 # same for hard split
-                new_hard_split_inds = np.where(lbd_vect > 1.5*lbd_spl)[0]
+                new_hard_split_inds = np.where(lbd_vect > lbd_spl_hard)[0]
                 for split_index in new_hard_split_inds:
                     # and split
                     lbd_vect, adj_matr = split(split_index, lbd_vect, adj_matr)
@@ -425,7 +427,7 @@ def evolve_adapt_timestep(
             elif event_ind == 1: # hard split event
                 if verbose: print(f'Interrupted by hard split at {time_current = :.1f}')
                 # determine where split happened and split
-                split_index = np.argmin(np.abs(lbd_vect - 1.5*lbd_spl))
+                split_index = np.argmin(np.abs(lbd_vect - lbd_spl_hard))
                 lbd_vect, adj_matr = split(split_index, lbd_vect, adj_matr)
                 
                 # find the split index in the splitting queue
@@ -446,7 +448,7 @@ def evolve_adapt_timestep(
                 split_index = [ind for ind in included_inds if ind not in split_index_queue][event_ind - 2]
                 
                 # sample time-to-split: inv_P(uniform) is a sampled time-to-split (approx)
-                dLambdadt = dydt(0.0, lbd_vect, adj_matr, kappa, k, eps, lbd_spl)[split_index] 
+                dLambdadt = dydt(0.0, lbd_vect, adj_matr)[split_index] 
                 split_time = time_current + np.sqrt(-2 / r / dLambdadt * np.log(1 - random_uniform.get_next()))
                 
                 # add time and split index to split queues
@@ -500,34 +502,31 @@ def evolve_adapt_timestep(
     return t_range, lbd_vect_t, adj_matr_t
 
 def evolve_adapt_timestep_hard_split(
-        Nmax, 
-        L_full, 
-        Drho, 
-        Dc, 
-        T, 
-        epsilon, 
+        lbd_vect_ini, 
+        adj_matr_ini, 
+        KS_params,
         r, 
         lbd_spl, 
         n_steps, 
         dt, 
-        initial_distribution, 
-        mu, 
-        sig, 
+        merge_threshold=1e-1,
         save_states='grid', # can be 'grid', 'event', or 'end'
         verbose=False, 
         tqdm_bool=True, 
-        maxiter=1000, 
-        seed=0
+        maxiter=1_000, 
     ):
 
-    kappa, k, eps, _, _ = reparameterize(Drho, Dc, T, epsilon, r)
+    kappa, k, eps = reparameterize(*KS_params)
     
-    # initial conditions
-    lbd_vect_ini, adj_matr_ini = get_initials(Nmax, L_full, Drho, Dc, T, epsilon, r, lbd_spl, mu, sig, initial_distribution, seed=seed)
+    def dydt(t, y, adj_matr): # number of additional arguments to conform to the solve_ivp
+        return 0.5 * adj_matr @ (kappa * np.exp(-k * y) + eps * y)
+
+    def jac_dydt(t, y, adj_matr):
+        return 0.5 * adj_matr @ np.diag((-k * kappa * np.exp(-k * y) + eps))
 
     # initialize save variables
     if save_states == 'grid':
-        t_range, lbd_vect_t, adj_matr_t = np.arange(0, dt * n_steps, dt), np.zeros((Nmax, n_steps)), np.zeros((n_steps), dtype=object)
+        t_range, lbd_vect_t, adj_matr_t = np.arange(0, dt * n_steps, dt), np.zeros((len(lbd_vect_ini), n_steps)), np.zeros((n_steps), dtype=object)
         lbd_vect_t[:, 0] = lbd_vect_ini.copy()
         adj_matr_t[0] = adj_matr_ini.copy()
     elif save_states == 'event':
@@ -565,8 +564,8 @@ def evolve_adapt_timestep_hard_split(
                         y0=lbd_vect, 
                         method='BDF',
                         t_eval=t_eval_current if save_states == 'grid' else None, 
-                        events=[event_zero] + [get_event_split_single(ind, adj_matr, kappa, k, eps, lbd_spl) for ind in included_inds], 
-                        args=(adj_matr, kappa, k, eps, lbd_spl),
+                        events=[get_event_merge(merge_threshold)] + [get_event_split_single(ind, lbd_spl) for ind in included_inds], 
+                        args=(adj_matr),
                         jac=jac_dydt,
                         rtol=1e-6) # also can help: max_step (parameter)
         
@@ -596,7 +595,7 @@ def evolve_adapt_timestep_hard_split(
                 if verbose: print(f'Interrupted by merge at {time_current = :.1f}')
                 
                 # perform merge
-                lbd_vect, adj_matr = fix_negative_adaptive(lbd_vect, adj_matr)
+                lbd_vect, adj_matr = merge(lbd_vect, adj_matr, merge_threshold)
 
                 # when merging happens at Lambda_int > 0, a Lambda can jump the split threshold
                 new_split_inds = set(np.where(lbd_vect > lbd_spl)[0])

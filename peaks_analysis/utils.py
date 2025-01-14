@@ -21,13 +21,12 @@ def _lbd_spl_epsilon(epsilon):
         return np.exp(1.13734914) * epsilon**(-0.3579829)
 lbd_spl_epsilon = np.vectorize(_lbd_spl_epsilon)
 
-def reparameterize(Drho, Dc, T, epsilon, r):
+def reparameterize(Drho, Dc, T, epsilon):
     M = np.sqrt(12 * Drho * Dc / T)
     kappa = 1 / (1 / 4 / np.sqrt(Dc) + 1 / M / T)
     k = 1 / np.sqrt(Dc) 
     eps = 4 * epsilon * np.exp(-T * M / 2 / Drho / np.sqrt(Dc))
-    lbd_spl = lbd_spl_epsilon(epsilon)
-    return kappa, k, eps, lbd_spl, r
+    return kappa, k, eps
 
 def _epsilon_lbd_spl(lbd_spl):
     if lbd_spl == np.inf:
